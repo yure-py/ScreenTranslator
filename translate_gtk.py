@@ -98,17 +98,12 @@ deepl_pool = DeepLPool(DEEPL_KEYS_FILE)
 
 
 def _join_wrapped_lines(text):
-    """Tesseract keeps the visual line breaks from the rendered text box.
-    For VN dialogue those are just word-wrap, not real paragraphs, so we
-    join them back into one continuous line per paragraph (paragraphs are
-    still split on blank lines)."""
-    paragraphs = re.split(r"\n\s*\n", text)
-    joined = []
-    for p in paragraphs:
-        line = " ".join(l.strip() for l in p.splitlines() if l.strip())
-        if line:
-            joined.append(line)
-    return "\n\n".join(joined)
+    """Tesseract keeps the visual line breaks from the rendered text box,
+    and sometimes inserts a stray blank line between lines (extra vertical
+    spacing in the game's font rendering gets misread as a paragraph
+    break). VN dialogue boxes are effectively always a single continuous
+    message, so just join every non-empty line into one line."""
+    return " ".join(l.strip() for l in text.splitlines() if l.strip())
 
 
 def ocr_image(img):
