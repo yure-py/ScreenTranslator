@@ -15,6 +15,7 @@ Flow:
 import os
 os.environ.setdefault("GDK_BACKEND", "x11")
 
+import re
 import subprocess
 import tempfile
 import threading
@@ -25,13 +26,21 @@ from gi.repository import Gtk, Gdk, GLib, GdkPixbuf, Pango
 
 import cairo
 import pytesseract
+import requests
 from PIL import Image
 from deep_translator import GoogleTranslator
 
 POLL_MS = 300
 
+DEEPL_KEYS_FILE = os.path.expanduser("~/Games/Textractor/deepl/keys.txt")
+
 
 def capture_fullscreen():
+    """Full-desktop screenshot via spectacle (KDE's screenshot portal).
+    Direct X11 capture (e.g. via mss/XGetImage) returns solid black under
+    KWin/Wayland since the X11 root window doesn't reflect real compositor
+    output there - spectacle goes through the proper Wayland screenshot
+    API instead, which is slower (~1.2s) but actually works."""
     fd, path = tempfile.mkstemp(suffix=".png")
     os.close(fd)
     result = subprocess.run(
@@ -43,17 +52,79 @@ def capture_fullscreen():
     return path
 
 
+class DeepLPool:
+    """Rotates through multiple free-tier DeepL API keys, moving to the
+    next one when the current key's quota is exhausted."""
+
+    def __init__(self, keys_file):
+        self.keys = []
+        if os.path.exists(keys_file):
+            with open(keys_file) as f:
+                self.keys = [line.strip() for line in f if line.strip()]
+        self.idx = 0
+
+    def available(self):
+        return bool(self.keys)
+
+    def translate(self, text):
+        while self.idx < len(self.keys):
+            key = self.keys[self.idx]
+            host = "api-free.deepl.com" if key.endswith(":fx") else "api.deepl.com"
+            try:
+                resp = requests.post(
+                    f"https://{host}/v2/translate",
+                    headers={"Authorization": f"DeepL-Auth-Key {key}"},
+                    data={"text": text, "target_lang": "PT-BR", "source_lang": "EN"},
+                    timeout=15,
+                )
+            except requests.RequestException as e:
+                return f"[erro de rede DeepL: {e}]"
+
+            if resp.status_code == 200:
+                return resp.json()["translations"][0]["text"]
+
+            if resp.status_code in (456, 403, 429):
+                self.idx += 1
+                continue
+
+            return f"[erro DeepL HTTP {resp.status_code}]"
+
+        return "[todas as chaves DeepL esgotadas]"
+
+
+deepl_pool = DeepLPool(DEEPL_KEYS_FILE)
+
+
+
+
+def _join_wrapped_lines(text):
+    """Tesseract keeps the visual line breaks from the rendered text box.
+    For VN dialogue those are just word-wrap, not real paragraphs, so we
+    join them back into one continuous line per paragraph (paragraphs are
+    still split on blank lines)."""
+    paragraphs = re.split(r"\n\s*\n", text)
+    joined = []
+    for p in paragraphs:
+        line = " ".join(l.strip() for l in p.splitlines() if l.strip())
+        if line:
+            joined.append(line)
+    return "\n\n".join(joined)
+
+
 def ocr_image(img):
     w, h = img.size
     if w < 800:
         scale = 800 / w
         img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-    return pytesseract.image_to_string(img, lang="eng").strip()
+    text = pytesseract.image_to_string(img, lang="eng").strip()
+    return _join_wrapped_lines(text)
 
 
-def translate_text(text):
+def translate_text(text, engine="google"):
     if not text:
         return ""
+    if engine == "deepl" and deepl_pool.available():
+        return deepl_pool.translate(text)
     try:
         return GoogleTranslator(source="en", target="pt").translate(text)
     except Exception as e:
@@ -246,10 +317,19 @@ class Overlay:
         self.win.resize(width, height)
         self.box.set_size_request(width, height)
         self._update_label_geometry()
+        GLib.idle_add(self._enforce_size)
 
     def _update_label_geometry(self):
         padding = 14 * 2
-        self.label.set_size_request(max(10, self.width - padding), -1)
+        avail_width = max(10, self.width - padding)
+        self.label.set_size_request(avail_width, -1)
+        # max-width-chars caps the label's *natural* width request (unlike
+        # size-request, which is only a minimum), which is what actually
+        # stops the POPUP window from growing to fit an unwrapped line.
+        avg_char_px = max(4, self.font_size * 0.55)
+        max_chars = max(5, int(avail_width / avg_char_px))
+        self.label.set_max_width_chars(max_chars)
+
         line_height = self.font_size * 1.4
         max_lines = max(1, int((self.height - padding) / line_height))
         self.label.set_lines(max_lines)
@@ -284,6 +364,14 @@ class Overlay:
         translated = GLib.markup_escape_text(getattr(self, "_translated", "") or "")
         markup = f'<span foreground="{color_hex}" font="{self.font_size}">{translated}</span>'
         self.label.set_markup(markup)
+        # POPUP/override-redirect windows keep re-sizing themselves to fit
+        # their content on the next layout pass, so the fixed size has to
+        # be re-asserted *after* that pass settles, not immediately here.
+        GLib.idle_add(self._enforce_size)
+
+    def _enforce_size(self):
+        self.win.resize(self.width, self.height)
+        return False
 
 
 class App:
@@ -318,6 +406,18 @@ class App:
         self.status_label = Gtk.Label(label="Nenhuma area selecionada.")
         self.status_label.set_line_wrap(True)
         outer.pack_start(self.status_label, False, False, 0)
+
+        engine_row = Gtk.Box(spacing=8)
+        outer.pack_start(engine_row, False, False, 0)
+        engine_row.pack_start(Gtk.Label(label="Motor de traducao:"), False, False, 0)
+        self.engine_combo = Gtk.ComboBoxText()
+        self.engine_combo.append("google", "Google Translate (gratis)")
+        deepl_label = "DeepL"
+        if not deepl_pool.available():
+            deepl_label += " (sem chaves configuradas)"
+        self.engine_combo.append("deepl", deepl_label)
+        self.engine_combo.set_active_id("google")
+        engine_row.pack_start(self.engine_combo, False, False, 0)
 
         outer.pack_start(Gtk.Separator(), False, False, 4)
 
@@ -424,6 +524,8 @@ class App:
         if not self.running:
             return
 
+        engine = self.engine_combo.get_active_id() or "google"
+
         def work():
             rx, ry, rw, rh = self.region
             path = capture_fullscreen()
@@ -438,7 +540,7 @@ class App:
 
             translated = None
             if text and text != self.last_text:
-                translated = translate_text(text)
+                translated = translate_text(text, engine)
 
             GLib.idle_add(self._poll_done, text, translated)
 
