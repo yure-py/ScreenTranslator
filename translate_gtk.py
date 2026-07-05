@@ -1079,7 +1079,6 @@ class App:
         self._save_shortcut_settings()
 
     def _on_shortcut_activated(self, shortcut_id):
-        print(f"[app] atalho ativado: {shortcut_id}", flush=True)
         suffix = "_" + self.shortcut_id_suffix
         action = shortcut_id[: -len(suffix)] if shortcut_id.endswith(suffix) else shortcut_id
 
