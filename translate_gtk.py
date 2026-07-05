@@ -15,10 +15,13 @@ Flow:
 import os
 os.environ.setdefault("GDK_BACKEND", "x11")
 
+import json
 import re
 import subprocess
 import tempfile
 import threading
+import time
+from datetime import datetime
 
 import gi
 gi.require_version("Gtk", "3.0")
@@ -30,7 +33,12 @@ import requests
 from PIL import Image
 from deep_translator import GoogleTranslator
 
+from portal_capture import PortalCapture
+
 POLL_MS = 300
+MAX_TIMING_LOG_ENTRIES = 500
+TIMING_LOG_PAGE_SIZE = 25
+TIMING_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "timing_debug.jsonl")
 
 DEEPL_KEYS_FILE = os.path.expanduser("~/Games/Textractor/deepl/keys.txt")
 
@@ -126,35 +134,67 @@ def translate_text(text, engine="google"):
         return f"[erro na traducao: {e}]"
 
 
+def _pil_to_pixbuf(img):
+    data = GLib.Bytes.new(img.tobytes())
+    return GdkPixbuf.Pixbuf.new_from_bytes(
+        data, GdkPixbuf.Colorspace.RGB, False, 8, img.width, img.height, img.width * 3,
+    )
+
+
 class RegionSelector:
-    """Fullscreen borderless window showing a real screenshot as backdrop.
-    User drags a rectangle on top of it; result returned in physical
-    screenshot-pixel coordinates.
+    """Lets the user drag-select a rectangle over a screenshot backdrop.
+
+    Two modes:
+    - portal_image=None (default): fullscreen borderless window overlaid
+      directly on the real desktop, using a spectacle screenshot of *all*
+      monitors. Result is in that global (XWayland) pixel space.
+    - portal_image=<PIL Image>: shows that single-monitor portal frame in
+      a normal window instead (not overlaid on the real screen), since
+      portal/Wayland-native monitor coordinates don't line up with
+      XWayland's global coordinate space. Result is in that image's own
+      local pixel space, directly usable with PortalCapture.grab_region().
     """
 
-    def __init__(self, on_done):
+    def __init__(self, on_done, portal_image=None):
         self.on_done = on_done
 
-        shot_path = capture_fullscreen()
-        if not shot_path:
-            on_done(None)
-            return
+        if portal_image is not None:
+            self.pixbuf_full = _pil_to_pixbuf(portal_image)
+            img_w, img_h = portal_image.width, portal_image.height
 
-        self.pixbuf_full = GdkPixbuf.Pixbuf.new_from_file(shot_path)
-        os.remove(shot_path)
+            scr = Gdk.Screen.get_default()
+            avail_w, avail_h = int(scr.get_width() * 0.85), int(scr.get_height() * 0.85)
+            ratio = min(avail_w / img_w, avail_h / img_h, 1.0)
+            self.sw, self.sh = int(img_w * ratio), int(img_h * ratio)
 
-        # Use the combined virtual-desktop size (all monitors), matching
-        # what "spectacle -f" actually captures.
-        scr = Gdk.Screen.get_default()
-        self.sw, self.sh = scr.get_width(), scr.get_height()
+            self.scale_x = img_w / self.sw
+            self.scale_y = img_h / self.sh
 
-        self.scale_x = self.pixbuf_full.get_width() / self.sw
-        self.scale_y = self.pixbuf_full.get_height() / self.sh
+            self.win = Gtk.Window()
+            self.win.set_title("Selecione a area do texto (imagem do monitor)")
+            self.win.set_default_size(self.sw, self.sh)
+            self.win.connect("delete-event", lambda w, e: self._cancel())
+        else:
+            shot_path = capture_fullscreen()
+            if not shot_path:
+                on_done(None)
+                return
 
-        self.win = Gtk.Window(type=Gtk.WindowType.POPUP)
-        self.win.set_decorated(False)
-        self.win.set_default_size(self.sw, self.sh)
-        self.win.move(0, 0)
+            self.pixbuf_full = GdkPixbuf.Pixbuf.new_from_file(shot_path)
+            os.remove(shot_path)
+
+            # Use the combined virtual-desktop size (all monitors), matching
+            # what "spectacle -f" actually captures.
+            scr = Gdk.Screen.get_default()
+            self.sw, self.sh = scr.get_width(), scr.get_height()
+
+            self.scale_x = self.pixbuf_full.get_width() / self.sw
+            self.scale_y = self.pixbuf_full.get_height() / self.sh
+
+            self.win = Gtk.Window(type=Gtk.WindowType.POPUP)
+            self.win.set_decorated(False)
+            self.win.set_default_size(self.sw, self.sh)
+            self.win.move(0, 0)
 
         overlay = Gtk.Overlay()
         self.win.add(overlay)
@@ -196,8 +236,12 @@ class RegionSelector:
 
     def _on_key(self, widget, event):
         if event.keyval == Gdk.KEY_Escape:
-            self.win.destroy()
-            self.on_done(None)
+            self._cancel()
+
+    def _cancel(self):
+        self.win.destroy()
+        self.on_done(None)
+        return True
 
     def _on_press(self, widget, event):
         self.start = (event.x, event.y)
@@ -374,6 +418,12 @@ class App:
         self.region = None
         self.running = False
         self.last_text = None
+        self.timing_log = []
+        self.timing_window = None
+        self.timing_page = 0
+        self.portal = None
+        self.portal_ready = False
+        self.region_is_portal = False
 
         self.overlay = Overlay()
 
@@ -413,6 +463,22 @@ class App:
         self.engine_combo.append("deepl", deepl_label)
         self.engine_combo.set_active_id("google")
         engine_row.pack_start(self.engine_combo, False, False, 0)
+
+        portal_row = Gtk.Box(spacing=8)
+        outer.pack_start(portal_row, False, False, 0)
+        self.portal_btn = Gtk.Button(label="Ativar captura rapida (ScreenCast)")
+        self.portal_btn.connect("clicked", self._on_enable_portal)
+        portal_row.pack_start(self.portal_btn, False, False, 0)
+        self.portal_status_label = Gtk.Label(label="Captura: spectacle (~1.2s/ciclo)")
+        portal_row.pack_start(self.portal_status_label, False, False, 0)
+
+        debug_row = Gtk.Box(spacing=8)
+        outer.pack_start(debug_row, False, False, 0)
+        self.debug_check = Gtk.CheckButton(label="Registrar tempos (debug)")
+        debug_row.pack_start(self.debug_check, False, False, 0)
+        self.timing_btn = Gtk.Button(label="Ver logs de tempo")
+        self.timing_btn.connect("clicked", self._on_show_timing)
+        debug_row.pack_start(self.timing_btn, False, False, 0)
 
         outer.pack_start(Gtk.Separator(), False, False, 4)
 
@@ -488,21 +554,35 @@ class App:
 
     def _on_select(self, widget):
         self.running = False
-        self.win.iconify()
-        GLib.timeout_add(300, self._launch_selector)
+
+        if self.portal_ready:
+            # Select directly on a portal frame: same coordinate space used
+            # for capture, so no XWayland/Wayland coordinate mismatch.
+            frame = self.portal.grab_frame()
+            if frame is None:
+                self.status_label.set_text("Falha ao capturar frame do portal para selecao.")
+                return
+            self.region_is_portal = True
+            RegionSelector(self._region_selected, portal_image=frame)
+        else:
+            self.region_is_portal = False
+            self.win.iconify()
+            GLib.timeout_add(300, self._launch_selector)
 
     def _launch_selector(self):
         RegionSelector(self._region_selected)
         return False
 
     def _region_selected(self, region):
-        self.win.deiconify()
+        if self.win.get_window() is not None:
+            self.win.deiconify()
         if region is None:
             self.status_label.set_text("Selecao cancelada.")
             return
         x, y, w, h = region
         self.region = region
-        self.status_label.set_text(f"Area selecionada: {w}x{h} em ({x},{y})")
+        method = "portal" if self.region_is_portal else "spectacle"
+        self.status_label.set_text(f"Area selecionada: {w}x{h} em ({x},{y}) [{method}]")
         self.toggle_btn.set_sensitive(True)
 
     def _on_toggle(self, widget):
@@ -520,36 +600,205 @@ class App:
             return
 
         engine = self.engine_combo.get_active_id() or "google"
+        debug_timing = self.debug_check.get_active()
+
+        use_portal = self.portal_ready and self.region_is_portal
 
         def work():
+            t_start = time.time()
             rx, ry, rw, rh = self.region
-            path = capture_fullscreen()
-            text = None
-            if path:
-                try:
-                    full = Image.open(path)
-                    crop = full.crop((rx, ry, rx + rw, ry + rh))
+
+            crop = None
+            if use_portal:
+                # Region was selected directly on a portal frame, so these
+                # are already local coordinates within that captured
+                # monitor - no global/local offset translation needed.
+                frame = self.portal.grab_frame()
+                crop = frame.crop((rx, ry, rx + rw, ry + rh)) if frame is not None else None
+                t_capture = time.time()
+                if crop is not None:
                     text = ocr_image(crop)
-                finally:
-                    os.remove(path)
+                else:
+                    text = None
+            else:
+                path = capture_fullscreen()
+                t_capture = time.time()
+                text = None
+                if path:
+                    try:
+                        full = Image.open(path)
+                        crop = full.crop((rx, ry, rx + rw, ry + rh))
+                        text = ocr_image(crop)
+                    finally:
+                        os.remove(path)
+            t_ocr = time.time()
 
             translated = None
-            if text and text != self.last_text:
+            did_translate = bool(text and text != self.last_text)
+            if did_translate:
                 translated = translate_text(text, engine)
+            t_translate = time.time()
 
-            GLib.idle_add(self._poll_done, text, translated)
+            timing = None
+            if debug_timing:
+                timing = {
+                    "time": datetime.now().strftime("%H:%M:%S"),
+                    "capture": t_capture - t_start,
+                    "ocr": t_ocr - t_capture,
+                    "translate": (t_translate - t_ocr) if did_translate else 0.0,
+                    "total": t_translate - t_start,
+                    "engine": engine if did_translate else "-",
+                    "ocr_text": text or "",
+                    "translated_text": translated or "",
+                    "changed": did_translate,
+                    "capture_method": "portal" if use_portal else "spectacle",
+                }
+
+            GLib.idle_add(self._poll_done, text, translated, timing)
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _poll_done(self, text, translated):
+    def _poll_done(self, text, translated, timing):
         if text and translated is not None and text != self.last_text:
             self.last_text = text
             self.overlay.set_text(translated)
             self.ocr_label.set_text(text)
 
+        if timing is not None:
+            self._add_timing_entry(timing)
+
         if self.running:
             GLib.timeout_add(POLL_MS, self._poll)
         return False
+
+    def _add_timing_entry(self, entry):
+        self.timing_log.append(entry)
+        if len(self.timing_log) > MAX_TIMING_LOG_ENTRIES:
+            del self.timing_log[: len(self.timing_log) - MAX_TIMING_LOG_ENTRIES]
+        if self.timing_window is not None and self.timing_window.get_visible():
+            self._refresh_timing_table()
+
+        with open(TIMING_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def _on_enable_portal(self, widget):
+        self.portal_btn.set_sensitive(False)
+        self.portal_status_label.set_text("Captura: aguardando selecao no dialogo do KDE...")
+
+        self.portal = PortalCapture()
+
+        def on_ready():
+            self.portal_ready = True
+            self.portal_status_label.set_text("Captura: ScreenCast (rapida, ~20-60ms/ciclo)")
+            self.portal_btn.set_label("Captura rapida ativa")
+
+        def on_error(message):
+            self.portal_ready = False
+            self.portal_status_label.set_text(f"Captura: spectacle (falhou ativar rapida: {message})")
+            self.portal_btn.set_sensitive(True)
+
+        self.portal.start_async(on_ready, on_error)
+
+    def _on_show_timing(self, widget):
+        if self.timing_window is None:
+            self._build_timing_window()
+        self.timing_page = 0
+        self._refresh_timing_table()
+        self.timing_window.show_all()
+        self.timing_window.present()
+
+    def _build_timing_window(self):
+        win = Gtk.Window()
+        win.set_title("Logs de tempo (debug)")
+        win.set_default_size(1100, 500)
+        win.connect("delete-event", lambda w, e: w.hide() or True)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.set_border_width(10)
+        win.add(box)
+
+        self.timing_store = Gtk.ListStore(str, str, str, str, str, str, str, str, str, str)
+        tree = Gtk.TreeView(model=self.timing_store)
+        for i, title in enumerate(
+            ["Hora", "Captura", "Captura (s)", "OCR (s)", "Traducao (s)", "Total (s)", "Motor",
+             "Mudou?", "Texto OCR", "Texto traduzido"]
+        ):
+            col = Gtk.TreeViewColumn(title, Gtk.CellRendererText(), text=i)
+            col.set_resizable(True)
+            if title in ("Texto OCR", "Texto traduzido"):
+                col.set_min_width(200)
+            tree.append_column(col)
+
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroller.add(tree)
+        scroller.set_vexpand(True)
+        box.pack_start(scroller, True, True, 0)
+
+        nav = Gtk.Box(spacing=8)
+        box.pack_start(nav, False, False, 0)
+
+        clear_btn = Gtk.Button(label="Limpar logs")
+        clear_btn.connect("clicked", self._on_clear_timing)
+        nav.pack_start(clear_btn, False, False, 0)
+
+        prev_btn = Gtk.Button(label="<< Anterior")
+        prev_btn.connect("clicked", self._on_timing_prev)
+        nav.pack_start(prev_btn, False, False, 0)
+
+        self.timing_page_label = Gtk.Label(label="")
+        nav.pack_start(self.timing_page_label, False, False, 0)
+
+        next_btn = Gtk.Button(label="Proxima >>")
+        next_btn.connect("clicked", self._on_timing_next)
+        nav.pack_start(next_btn, False, False, 0)
+
+        self.timing_window = win
+
+    def _on_clear_timing(self, widget):
+        self.timing_log.clear()
+        self.timing_page = 0
+        self._refresh_timing_table()
+
+    def _on_timing_prev(self, widget):
+        if self.timing_page > 0:
+            self.timing_page -= 1
+            self._refresh_timing_table()
+
+    def _on_timing_next(self, widget):
+        max_page = max(0, (len(self.timing_log) - 1) // TIMING_LOG_PAGE_SIZE)
+        if self.timing_page < max_page:
+            self.timing_page += 1
+            self._refresh_timing_table()
+
+    def _refresh_timing_table(self):
+        self.timing_store.clear()
+        # Newest entries first.
+        entries = list(reversed(self.timing_log))
+        max_page = max(0, (len(entries) - 1) // TIMING_LOG_PAGE_SIZE)
+        self.timing_page = min(self.timing_page, max_page)
+
+        start = self.timing_page * TIMING_LOG_PAGE_SIZE
+        page_entries = entries[start:start + TIMING_LOG_PAGE_SIZE]
+
+        for e in page_entries:
+            self.timing_store.append([
+                e["time"],
+                e.get("capture_method", "?"),
+                f'{e["capture"]:.2f}',
+                f'{e["ocr"]:.2f}',
+                f'{e["translate"]:.2f}',
+                f'{e["total"]:.2f}',
+                e["engine"],
+                "sim" if e["changed"] else "nao",
+                e["ocr_text"],
+                e["translated_text"],
+            ])
+
+        total_pages = max_page + 1
+        self.timing_page_label.set_text(
+            f"Pagina {self.timing_page + 1}/{total_pages} ({len(entries)} registros)"
+        )
 
     def _on_close(self, widget):
         self.running = False
