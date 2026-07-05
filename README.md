@@ -48,3 +48,7 @@ GDK_BACKEND=x11 python3 translate_gtk.py
 
 `translate_region.py` is an earlier Tkinter-based prototype kept for
 reference; `translate_gtk.py` is the recommended, working version.
+
+---
+
+vibecodei isso ai pra jogar VN ta ligado nao tinha um software bom que rodasse legal no linux se tiver um sugestão de melhora pode abrir uma issue ai 
