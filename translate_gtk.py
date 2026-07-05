@@ -34,6 +34,7 @@ from PIL import Image
 from deep_translator import GoogleTranslator
 
 from portal_capture import PortalCapture
+from global_shortcuts import GlobalShortcuts
 
 POLL_MS = 300
 MAX_TIMING_LOG_ENTRIES = 500
@@ -41,6 +42,26 @@ TIMING_LOG_PAGE_SIZE = 25
 TIMING_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "timing_debug.jsonl")
 
 DEEPL_KEYS_FILE = os.path.expanduser("~/Games/Textractor/deepl/keys.txt")
+
+SETTINGS_FILE = os.path.expanduser("~/.config/screentranslator/settings.json")
+
+
+def load_settings():
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def save_settings(settings):
+    os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+    tmp = SETTINGS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=2)
+    os.replace(tmp, SETTINGS_FILE)
 
 
 def capture_fullscreen():
@@ -284,6 +305,7 @@ class Overlay:
     def __init__(self):
         self.width = 600
         self.height = 160
+        self.on_change = None  # optional callback(), fired after any user-driven change
 
         self.win = Gtk.Window(type=Gtk.WindowType.POPUP)
         self.win.set_decorated(False)
@@ -348,6 +370,38 @@ class Overlay:
 
     def _drag_end(self, widget, event):
         self._drag_offset = None
+        if self.on_change:
+            self.on_change()
+
+    def get_state(self):
+        x, y = self.win.get_position()
+        return {
+            "x": x, "y": y,
+            "width": self.width, "height": self.height,
+            "font_size": self.font_size,
+            "bg_alpha": self.bg_alpha,
+            "text_color": list(self.text_color),
+        }
+
+    def apply_state(self, state):
+        if "width" in state and "height" in state:
+            self.set_size(int(state["width"]), int(state["height"]))
+        if "font_size" in state:
+            self.set_font_size(int(state["font_size"]))
+        if "bg_alpha" in state:
+            self.set_bg_alpha(float(state["bg_alpha"]))
+        if "text_color" in state:
+            self.set_text_color(tuple(state["text_color"]))
+
+        if "x" in state and "y" in state:
+            scr = Gdk.Screen.get_default()
+            sw, sh = scr.get_width(), scr.get_height()
+            x, y = int(state["x"]), int(state["y"])
+            # Only trust the saved position if it still fits on the current
+            # virtual desktop - monitor/resolution changes since the last
+            # run could otherwise put the overlay somewhere unreachable.
+            if 0 <= x and 0 <= y and x + self.width <= sw and y + self.height <= sh:
+                self.win.move(x, y)
 
     def set_size(self, width, height):
         self.width = width
@@ -413,6 +467,13 @@ class Overlay:
         return False
 
 
+MODIFIER_KEYVAL_NAMES = {
+    "Shift_L", "Shift_R", "Control_L", "Control_R",
+    "Alt_L", "Alt_R", "Super_L", "Super_R", "Meta_L", "Meta_R",
+    "Caps_Lock", "ISO_Level3_Shift",
+}
+
+
 class App:
     def __init__(self):
         self.region = None
@@ -424,20 +485,52 @@ class App:
         self.portal = None
         self.portal_ready = False
         self.region_is_portal = False
+        self.shortcuts = None
+        self.shortcut_triggers = {
+            "toggle": "SHIFT+w", "reselect": "SHIFT+q", "toggle_overlay": "SHIFT+e",
+        }
+        # Suffix appended to the portal shortcut IDs. If a shortcut ever
+        # gets stuck without a key assigned (e.g. user dismissed/conflicted
+        # the KDE dialog), KDE remembers that empty binding forever under
+        # the same ID. Generating a fresh suffix makes the portal treat the
+        # next bind attempt as brand-new shortcuts instead of reusing the
+        # stuck ones - no need to touch System Settings.
+        self.shortcut_id_suffix = "".join(f"{b:02x}" for b in os.urandom(3))
+        self.overlay_visible = True
+        self.capturing_shortcut = None
 
         self.overlay = Overlay()
 
         self.win = Gtk.Window()
         self.win.set_title("Tradutor de Tela")
-        self.win.set_default_size(420, 380)
+        self.win.set_default_size(460, 420)
         self.win.connect("destroy", self._on_close)
+        self.win.connect("key-press-event", self._on_capture_key)
 
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        outer.set_border_width(12)
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        outer.set_border_width(10)
         self.win.add(outer)
 
+        notebook = Gtk.Notebook()
+        outer.pack_start(notebook, True, True, 0)
+
+        notebook.append_page(self._build_general_tab(), Gtk.Label(label="Geral"))
+        notebook.append_page(self._build_overlay_tab(), Gtk.Label(label="Overlay"))
+        notebook.append_page(self._build_capture_tab(), Gtk.Label(label="Captura rapida"))
+        notebook.append_page(self._build_shortcuts_tab(), Gtk.Label(label="Atalhos"))
+        notebook.append_page(self._build_debug_tab(), Gtk.Label(label="Debug"))
+
+        self.overlay.on_change = self._save_overlay_settings
+
+        self.win.show_all()
+        self._load_overlay_settings()
+
+    def _build_general_tab(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.set_border_width(10)
+
         row1 = Gtk.Box(spacing=8)
-        outer.pack_start(row1, False, False, 0)
+        box.pack_start(row1, False, False, 0)
 
         self.select_btn = Gtk.Button(label="Selecionar area")
         self.select_btn.connect("clicked", self._on_select)
@@ -450,10 +543,11 @@ class App:
 
         self.status_label = Gtk.Label(label="Nenhuma area selecionada.")
         self.status_label.set_line_wrap(True)
-        outer.pack_start(self.status_label, False, False, 0)
+        self.status_label.set_xalign(0)
+        box.pack_start(self.status_label, False, False, 0)
 
         engine_row = Gtk.Box(spacing=8)
-        outer.pack_start(engine_row, False, False, 0)
+        box.pack_start(engine_row, False, False, 0)
         engine_row.pack_start(Gtk.Label(label="Motor de traducao:"), False, False, 0)
         self.engine_combo = Gtk.ComboBoxText()
         self.engine_combo.append("google", "Google Translate (gratis)")
@@ -464,26 +558,21 @@ class App:
         self.engine_combo.set_active_id("google")
         engine_row.pack_start(self.engine_combo, False, False, 0)
 
-        portal_row = Gtk.Box(spacing=8)
-        outer.pack_start(portal_row, False, False, 0)
-        self.portal_btn = Gtk.Button(label="Ativar captura rapida (ScreenCast)")
-        self.portal_btn.connect("clicked", self._on_enable_portal)
-        portal_row.pack_start(self.portal_btn, False, False, 0)
-        self.portal_status_label = Gtk.Label(label="Captura: spectacle (~1.2s/ciclo)")
-        portal_row.pack_start(self.portal_status_label, False, False, 0)
+        box.pack_start(Gtk.Separator(), False, False, 4)
+        box.pack_start(Gtk.Label(label="Texto original (OCR):", halign=Gtk.Align.START), False, False, 0)
+        self.ocr_label = Gtk.Label(label="")
+        self.ocr_label.set_line_wrap(True)
+        self.ocr_label.set_xalign(0)
+        box.pack_start(self.ocr_label, False, False, 0)
 
-        debug_row = Gtk.Box(spacing=8)
-        outer.pack_start(debug_row, False, False, 0)
-        self.debug_check = Gtk.CheckButton(label="Registrar tempos (debug)")
-        debug_row.pack_start(self.debug_check, False, False, 0)
-        self.timing_btn = Gtk.Button(label="Ver logs de tempo")
-        self.timing_btn.connect("clicked", self._on_show_timing)
-        debug_row.pack_start(self.timing_btn, False, False, 0)
+        return box
 
-        outer.pack_start(Gtk.Separator(), False, False, 4)
+    def _build_overlay_tab(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.set_border_width(10)
 
         grid = Gtk.Grid(column_spacing=8, row_spacing=8)
-        outer.pack_start(grid, False, False, 0)
+        box.pack_start(grid, False, False, 0)
 
         grid.attach(Gtk.Label(label="Tamanho da fonte:", halign=Gtk.Align.START), 0, 0, 1, 1)
         font_adj = Gtk.Adjustment(value=20, lower=8, upper=60, step_increment=1)
@@ -523,34 +612,221 @@ class App:
         self.height_scale.connect("value-changed", self._on_size_changed)
         grid.attach(self.height_scale, 1, 4, 1, 1)
 
-        outer.pack_start(Gtk.Separator(), False, False, 4)
+        box.pack_start(Gtk.Separator(), False, False, 4)
         hint = Gtk.Label()
         hint.set_markup(
             "<i>Arraste a propria caixa de traducao na tela para reposiciona-la.</i>"
         )
         hint.set_line_wrap(True)
-        outer.pack_start(hint, False, False, 0)
+        box.pack_start(hint, False, False, 0)
 
-        outer.pack_start(Gtk.Label(label="Texto original (OCR):", halign=Gtk.Align.START), False, False, 0)
-        self.ocr_label = Gtk.Label(label="")
-        self.ocr_label.set_line_wrap(True)
-        self.ocr_label.set_xalign(0)
-        outer.pack_start(self.ocr_label, False, False, 0)
+        return box
 
-        self.win.show_all()
+    def _build_capture_tab(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.set_border_width(10)
+
+        info = Gtk.Label()
+        info.set_markup(
+            "<i>Captura rapida compartilha a tela de um monitor com o app (via "
+            "portal do sistema), tornando a traducao ~15x mais rapida. Requer "
+            "autorizacao (dialogo do KDE).</i>"
+        )
+        info.set_line_wrap(True)
+        info.set_xalign(0)
+        box.pack_start(info, False, False, 0)
+
+        row = Gtk.Box(spacing=8)
+        box.pack_start(row, False, False, 0)
+        self.portal_btn = Gtk.Button(label="Ativar captura rapida (ScreenCast)")
+        self.portal_btn.connect("clicked", self._on_enable_portal)
+        row.pack_start(self.portal_btn, False, False, 0)
+
+        self.portal_revoke_btn = Gtk.Button(label="Parar / trocar monitor")
+        self.portal_revoke_btn.set_sensitive(False)
+        self.portal_revoke_btn.connect("clicked", self._on_revoke_portal)
+        row.pack_start(self.portal_revoke_btn, False, False, 0)
+
+        self.portal_status_label = Gtk.Label(label="Captura: spectacle (~1.2s/ciclo)")
+        self.portal_status_label.set_line_wrap(True)
+        self.portal_status_label.set_xalign(0)
+        box.pack_start(self.portal_status_label, False, False, 0)
+
+        return box
+
+    def _build_shortcuts_tab(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.set_border_width(10)
+
+        info = Gtk.Label()
+        info.set_markup(
+            "<i>Atalhos globais funcionam mesmo com o jogo em foco, mas so "
+            "enquanto este programa estiver aberto. Clique no botao e aperte "
+            "a combinacao de teclas desejada.</i>"
+        )
+        info.set_line_wrap(True)
+        info.set_xalign(0)
+        box.pack_start(info, False, False, 0)
+
+        grid = Gtk.Grid(column_spacing=8, row_spacing=8)
+        box.pack_start(grid, False, False, 0)
+
+        self.shortcut_buttons = {}
+        shortcut_rows = [
+            ("toggle", "Iniciar/Parar traducao:"),
+            ("reselect", "Refazer selecao:"),
+            ("toggle_overlay", "Mostrar/Esconder overlay:"),
+        ]
+        for i, (key, label) in enumerate(shortcut_rows):
+            grid.attach(Gtk.Label(label=label, halign=Gtk.Align.START), 0, i, 1, 1)
+            btn = Gtk.Button(label=self.shortcut_triggers[key])
+            btn.connect("clicked", lambda w, k=key: self._start_key_capture(k))
+            grid.attach(btn, 1, i, 1, 1)
+            self.shortcut_buttons[key] = btn
+
+        btn_row = Gtk.Box(spacing=8)
+        box.pack_start(btn_row, False, False, 0)
+
+        self.shortcuts_btn = Gtk.Button(label="Ativar atalhos globais")
+        self.shortcuts_btn.connect("clicked", self._on_enable_shortcuts)
+        btn_row.pack_start(self.shortcuts_btn, False, False, 0)
+
+        reset_btn = Gtk.Button(label="Resetar atalhos (corrigir travados)")
+        reset_btn.connect("clicked", self._on_reset_shortcuts)
+        btn_row.pack_start(reset_btn, False, False, 0)
+
+        self.shortcuts_status_label = Gtk.Label(label="Atalhos globais: desativados")
+        self.shortcuts_status_label.set_line_wrap(True)
+        self.shortcuts_status_label.set_xalign(0)
+        box.pack_start(self.shortcuts_status_label, False, False, 0)
+
+        return box
+
+    def _build_debug_tab(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.set_border_width(10)
+
+        self.debug_check = Gtk.CheckButton(label="Registrar tempos (debug)")
+        box.pack_start(self.debug_check, False, False, 0)
+
+        self.timing_btn = Gtk.Button(label="Ver logs de tempo")
+        self.timing_btn.connect("clicked", self._on_show_timing)
+        box.pack_start(self.timing_btn, False, False, 0)
+
+        return box
+
+    def _start_key_capture(self, which):
+        self.capturing_shortcut = which
+        self.shortcut_buttons[which].set_label("Pressione uma tecla...")
+
+    def _on_capture_key(self, widget, event):
+        if self.capturing_shortcut is None:
+            return False
+
+        keyval_name = Gdk.keyval_name(event.keyval)
+        if keyval_name in MODIFIER_KEYVAL_NAMES:
+            return True
+
+        parts = []
+        if event.state & Gdk.ModifierType.CONTROL_MASK:
+            parts.append("CONTROL")
+        if event.state & Gdk.ModifierType.SHIFT_MASK:
+            parts.append("SHIFT")
+        if event.state & Gdk.ModifierType.MOD1_MASK:
+            parts.append("ALT")
+        if event.state & Gdk.ModifierType.SUPER_MASK:
+            parts.append("SUPER")
+        parts.append(keyval_name.lower())
+        trigger = "+".join(parts)
+
+        which = self.capturing_shortcut
+        self.shortcut_triggers[which] = trigger
+        self.shortcut_buttons[which].set_label(trigger)
+        self.capturing_shortcut = None
+        self._save_shortcut_settings()
+        return True
 
     def _on_font_changed(self, scale):
         self.overlay.set_font_size(int(scale.get_value()))
+        self._save_overlay_settings()
 
     def _on_alpha_changed(self, scale):
         self.overlay.set_bg_alpha(scale.get_value() / 100.0)
+        self._save_overlay_settings()
 
     def _on_size_changed(self, scale):
         self.overlay.set_size(int(self.width_scale.get_value()), int(self.height_scale.get_value()))
+        self._save_overlay_settings()
 
     def _on_color_changed(self, btn):
         rgba = btn.get_rgba()
         self.overlay.set_text_color((rgba.red, rgba.green, rgba.blue))
+        self._save_overlay_settings()
+
+    def _save_overlay_settings(self):
+        current = load_settings()
+        current.update(self.overlay.get_state())
+        save_settings(current)
+
+    def _save_shortcut_settings(self):
+        current = load_settings()
+        current["shortcuts_enabled"] = self.shortcuts is not None
+        current["shortcut_triggers"] = self.shortcut_triggers
+        current["shortcut_id_suffix"] = self.shortcut_id_suffix
+        save_settings(current)
+
+    def _load_overlay_settings(self):
+        settings = load_settings()
+        if not settings:
+            return
+        self.overlay.apply_state(settings)
+        if "font_size" in settings:
+            self.font_scale.set_value(settings["font_size"])
+        if "bg_alpha" in settings:
+            self.alpha_scale.set_value(settings["bg_alpha"] * 100)
+        if "text_color" in settings:
+            r, g, b = settings["text_color"]
+            self.color_btn.set_rgba(Gdk.RGBA(r, g, b, 1))
+        if "width" in settings:
+            self.width_scale.set_value(settings["width"])
+        if "height" in settings:
+            self.height_scale.set_value(settings["height"])
+
+        if "shortcut_triggers" in settings:
+            self.shortcut_triggers.update(settings["shortcut_triggers"])
+            for key, btn in self.shortcut_buttons.items():
+                if key in self.shortcut_triggers:
+                    btn.set_label(self.shortcut_triggers[key])
+
+        if "shortcut_id_suffix" in settings:
+            self.shortcut_id_suffix = settings["shortcut_id_suffix"]
+
+        if settings.get("shortcuts_enabled"):
+            self._on_enable_shortcuts(None)
+
+        if "region" in settings:
+            x, y, w, h = settings["region"]
+            region_is_portal = settings.get("region_is_portal", False)
+            valid = True
+            if not region_is_portal:
+                # spectacle-mode regions are in the combined virtual-desktop
+                # space - only trust them if that space is still the same
+                # size (monitor/resolution changes could make old
+                # coordinates point at nonsense or out of bounds).
+                scr = Gdk.Screen.get_default()
+                sw, sh = scr.get_width(), scr.get_height()
+                valid = 0 <= x and 0 <= y and x + w <= sw and y + h <= sh
+
+            if valid:
+                self.region = (x, y, w, h)
+                self.region_is_portal = region_is_portal
+                method = "portal" if region_is_portal else "spectacle"
+                self.status_label.set_text(f"Area selecionada: {w}x{h} em ({x},{y}) [{method}]")
+                self.toggle_btn.set_sensitive(True)
+            else:
+                self.status_label.set_text(
+                    "Area salva nao cabe mais na tela atual - selecione de novo."
+                )
 
     def _on_select(self, widget):
         self.running = False
@@ -584,6 +860,13 @@ class App:
         method = "portal" if self.region_is_portal else "spectacle"
         self.status_label.set_text(f"Area selecionada: {w}x{h} em ({x},{y}) [{method}]")
         self.toggle_btn.set_sensitive(True)
+        self._save_region_settings()
+
+    def _save_region_settings(self):
+        current = load_settings()
+        current["region"] = list(self.region)
+        current["region_is_portal"] = self.region_is_portal
+        save_settings(current)
 
     def _on_toggle(self, widget):
         if self.running:
@@ -689,8 +972,22 @@ class App:
 
         def on_ready():
             self.portal_ready = True
-            self.portal_status_label.set_text("Captura: ScreenCast (rapida, ~20-60ms/ciclo)")
             self.portal_btn.set_label("Captura rapida ativa")
+            self.portal_revoke_btn.set_sensitive(True)
+
+            if self.region is not None and not self.region_is_portal:
+                # The existing selection was made in spectacle's coordinate
+                # space, which doesn't line up with the portal's monitor
+                # coordinates - it has to be redone now, in this new space,
+                # or capture would silently keep using spectacle forever.
+                self.portal_status_label.set_text(
+                    "Captura: ScreenCast ativa. Refazendo selecao de area "
+                    "(necessario ao trocar de modo de captura)..."
+                )
+                self.running = False
+                self._on_select(None)
+            else:
+                self.portal_status_label.set_text("Captura: ScreenCast (rapida, ~20-60ms/ciclo)")
 
         def on_error(message):
             self.portal_ready = False
@@ -698,6 +995,108 @@ class App:
             self.portal_btn.set_sensitive(True)
 
         self.portal.start_async(on_ready, on_error)
+
+    def _on_revoke_portal(self, widget):
+        if self.portal is not None:
+            self.portal.stop()
+        self.portal = None
+        self.portal_ready = False
+        self.region_is_portal = False
+        self.portal_btn.set_label("Ativar captura rapida (ScreenCast)")
+        self.portal_btn.set_sensitive(True)
+        self.portal_revoke_btn.set_sensitive(False)
+        self.portal_status_label.set_text(
+            "Captura: spectacle (~1.2s/ciclo). Selecione a area de novo para trocar de monitor."
+        )
+
+    def _on_enable_shortcuts(self, widget):
+        if self.shortcuts is not None:
+            self._disable_shortcuts()
+            return
+
+        print("[app] botao Ativar atalhos globais clicado", flush=True)
+        self.shortcuts_btn.set_sensitive(False)
+        self.shortcuts_status_label.set_text("Atalhos globais: aguardando autorizacao no KDE...")
+
+        shortcuts = GlobalShortcuts()
+        shortcuts.on_activated = self._on_shortcut_activated
+
+        def on_done(ok, message):
+            if ok:
+                self.shortcuts = shortcuts
+                triggers_desc = ", ".join(f"{k}={v}" for k, v in self.shortcut_triggers.items())
+                self.shortcuts_status_label.set_text(f"Atalhos globais: ativos ({triggers_desc})")
+                self.shortcuts_btn.set_label("Desativar atalhos globais")
+                self.shortcuts_btn.set_sensitive(True)
+            else:
+                self.shortcuts_status_label.set_text(f"Atalhos globais: falhou ({message})")
+                self.shortcuts_btn.set_sensitive(True)
+            self._save_shortcut_settings()
+
+        suffix = self.shortcut_id_suffix
+        shortcuts.bind_async(
+            {
+                f"toggle_{suffix}": ("Iniciar/Parar traducao", self.shortcut_triggers["toggle"]),
+                f"reselect_{suffix}": ("Refazer selecao de area", self.shortcut_triggers["reselect"]),
+                f"toggle_overlay_{suffix}": ("Mostrar/Esconder overlay", self.shortcut_triggers["toggle_overlay"]),
+            },
+            on_done,
+            parent_window=self._get_parent_window_handle(),
+        )
+
+    def _on_reset_shortcuts(self, widget):
+        """Generates a fresh ID suffix so the next activation registers
+        brand-new shortcuts with KDE, instead of reusing possibly-stuck
+        (key-less) registrations from a previous attempt."""
+        was_active = self.shortcuts is not None
+        if was_active:
+            self._disable_shortcuts()
+        self.shortcut_id_suffix = "".join(f"{b:02x}" for b in os.urandom(3))
+        self._save_shortcut_settings()
+        self.shortcuts_status_label.set_text(
+            "Atalhos globais: identificadores renovados. Clique em Ativar para tentar de novo."
+        )
+
+    def _get_parent_window_handle(self):
+        """Identifies our own window to the portal (as "x11:<hex xid>"), so
+        KDE attributes the shortcut request to this app instead of falling
+        back to whatever terminal launched the python process."""
+        gdk_window = self.win.get_window()
+        if gdk_window is None:
+            return ""
+        try:
+            xid = gdk_window.get_xid()
+        except AttributeError:
+            return ""
+        return f"x11:{xid:x}"
+
+    def _disable_shortcuts(self):
+        if self.shortcuts is not None:
+            self.shortcuts.stop()
+            self.shortcuts = None
+        self.shortcuts_status_label.set_text("Atalhos globais: desativados")
+        self.shortcuts_btn.set_label("Ativar atalhos globais")
+        self._save_shortcut_settings()
+
+    def _on_shortcut_activated(self, shortcut_id):
+        print(f"[app] atalho ativado: {shortcut_id}", flush=True)
+        suffix = "_" + self.shortcut_id_suffix
+        action = shortcut_id[: -len(suffix)] if shortcut_id.endswith(suffix) else shortcut_id
+
+        if action == "toggle":
+            if self.region is not None:
+                self._on_toggle(None)
+        elif action == "reselect":
+            self._on_select(None)
+        elif action == "toggle_overlay":
+            self._on_toggle_overlay_visibility()
+
+    def _on_toggle_overlay_visibility(self):
+        self.overlay_visible = not self.overlay_visible
+        if self.overlay_visible:
+            self.overlay.win.show()
+        else:
+            self.overlay.win.hide()
 
     def _on_show_timing(self, widget):
         if self.timing_window is None:
@@ -802,6 +1201,10 @@ class App:
 
     def _on_close(self, widget):
         self.running = False
+        if self.shortcuts is not None:
+            self.shortcuts.stop()
+        if self.portal is not None:
+            self.portal.stop()
         Gtk.main_quit()
 
     def run(self):
